@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
+gitoxide = []
 
 [dependencies]
 thiserror = "1"

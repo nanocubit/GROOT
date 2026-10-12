@@ -1,7 +1,11 @@
+//! Core backend contract for GROOT.
+
+use std::env;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BackendKind {
+    #[default]
     Legacy,
     Gitoxide,
 }
@@ -49,15 +53,12 @@ pub struct LegacyBackend;
 
 impl GitBackend for LegacyBackend {
     fn discover(start: &Path) -> BackendResult<RepositoryHandle> {
-        let candidate = if start.exists() {
-            start.to_path_buf()
-        } else {
+        if !start.exists() {
             return Err(BackendError::NotARepository(start.display().to_string()));
-        };
-
+        }
         Ok(RepositoryHandle {
-            git_dir: candidate.clone(),
-            work_tree: Some(candidate.clone()),
+            git_dir: start.to_path_buf(),
+            work_tree: Some(start.to_path_buf()),
             kind: RepositoryKind::Worktree,
             backend: BackendKind::Legacy,
         })
@@ -67,7 +68,6 @@ impl GitBackend for LegacyBackend {
         if !git_dir.exists() {
             return Err(BackendError::NotARepository(git_dir.display().to_string()));
         }
-
         Ok(RepositoryHandle {
             git_dir: git_dir.to_path_buf(),
             work_tree: work_tree.map(PathBuf::from),
@@ -80,19 +80,19 @@ impl GitBackend for LegacyBackend {
         })
     }
 
-    fn load_index(repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
+    fn load_index(_repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
         Ok(RepositoryIndex {
-            entries: vec![format!("legacy-index:{}", repo.git_dir.display())],
+            entries: vec!["legacy-placeholder".to_string()],
         })
     }
 
-    fn write_index(repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
-        index.entries.push(format!("legacy-write:{}", repo.git_dir.display()));
+    fn write_index(_repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
+        index.entries.push("legacy-write".to_string());
         Ok(())
     }
 
-    fn read_object(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
-        Ok(format!("legacy-object:{}:{}", repo.git_dir.display(), object_id))
+    fn read_object(_repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
+        Ok(format!("legacy-object:{}", object_id))
     }
 }
 
@@ -101,50 +101,23 @@ pub struct GitoxideBackend;
 
 impl GitBackend for GitoxideBackend {
     fn discover(start: &Path) -> BackendResult<RepositoryHandle> {
-        let candidate = if start.exists() {
-            start.to_path_buf()
-        } else {
-            return Err(BackendError::NotARepository(start.display().to_string()));
-        };
-
-        Ok(RepositoryHandle {
-            git_dir: candidate.clone(),
-            work_tree: Some(candidate.clone()),
-            kind: RepositoryKind::Worktree,
-            backend: BackendKind::Gitoxide,
-        })
+        crate::adapters::gitoxide::discover_impl(start)
     }
 
     fn open(git_dir: &Path, work_tree: Option<&Path>) -> BackendResult<RepositoryHandle> {
-        if !git_dir.exists() {
-            return Err(BackendError::NotARepository(git_dir.display().to_string()));
-        }
-
-        Ok(RepositoryHandle {
-            git_dir: git_dir.to_path_buf(),
-            work_tree: work_tree.map(PathBuf::from),
-            kind: if work_tree.is_some() {
-                RepositoryKind::Worktree
-            } else {
-                RepositoryKind::Bare
-            },
-            backend: BackendKind::Gitoxide,
-        })
+        crate::adapters::gitoxide::open_impl(git_dir, work_tree)
     }
 
     fn load_index(repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
-        Ok(RepositoryIndex {
-            entries: vec![format!("gix-index:{}", repo.git_dir.display())],
-        })
+        crate::adapters::gitoxide::load_index_impl(repo)
     }
 
     fn write_index(repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
-        index.entries.push(format!("gix-write:{}", repo.git_dir.display()));
-        Ok(())
+        crate::adapters::gitoxide::write_index_impl(repo, index)
     }
 
     fn read_object(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
-        Ok(format!("gix-object:{}:{}", repo.git_dir.display(), object_id))
+        crate::adapters::gitoxide::read_object_impl(repo, object_id)
     }
 }
 
@@ -153,6 +126,27 @@ pub struct AdapterConfig {
     pub default_backend: BackendKind,
 }
 
+impl AdapterConfig {
+    pub fn new(default_backend: BackendKind) -> Self {
+        Self { default_backend }
+    }
+}
+
 pub fn default_backend_kind() -> BackendKind {
     BackendKind::Legacy
 }
+
+pub fn backend_from_env() -> BackendKind {
+    match env::var("GROOT_BACKEND").ok().as_deref() {
+        Some("gitoxide") | Some("gix") => BackendKind::Gitoxide,
+        Some("legacy") => BackendKind::Legacy,
+        _ => default_backend_kind(),
+    }
+}
+
+pub fn resolve_backend(cfg: Option<AdapterConfig>) -> BackendKind {
+    cfg.map(|c| c.default_backend).unwrap_or_else(|| backend_from_env())
+}
+
+pub mod adapters;
+pub use adapters::gitoxide::GitoxideBackend as GixBackend;

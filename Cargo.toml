@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/groot-core", "crates/groot-compat"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["nanocubit"]
+rust-version = "1.78"
+
+[workspace.dependencies]
+thiserror = "1"
+
+[profile.dev]
+debug = true
+
+[profile.release]
+debug = false

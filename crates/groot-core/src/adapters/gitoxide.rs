@@ -145,3 +145,26 @@ impl GitBackend for GitoxideBackend {
         }
     }
 }
+
+// Exported wrapper functions expected by crate::adapters::gitoxide::discover_impl etc.
+// These simply delegate to the GitoxideBackend implementation so lib.rs can call them.
+
+pub fn discover_impl(start: &Path) -> BackendResult<RepositoryHandle> {
+    GitoxideBackend::discover(start)
+}
+
+pub fn open_impl(git_dir: &Path, work_tree: Option<&Path>) -> BackendResult<RepositoryHandle> {
+    GitoxideBackend::open(git_dir, work_tree)
+}
+
+pub fn load_index_impl(repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
+    GitoxideBackend::load_index(repo)
+}
+
+pub fn write_index_impl(repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
+    GitoxideBackend::write_index(repo, index)
+}
+
+pub fn read_object_impl(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
+    GitoxideBackend::read_object(repo, object_id)
+}

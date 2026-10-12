@@ -11,12 +11,23 @@ path = "src/lib.rs"
 
 [features]
 default = []
-gitoxide = []
+gitoxide = ["dep:gix", "dep:gix-discover", "dep:gix-odb", "dep:gix-index"]
 
 [dependencies]
 thiserror = "1"
-# gitoxide crates used by the Gitoxide adapter (used at integration/test time in GROOT)
-gix = "*"
-gix-discover = "*"
-gix-odb = "*"
-gix-index = "*"
+
+[dependencies.gix]
+version = "*"
+optional = true
+
+[dependencies.gix-discover]
+version = "*"
+optional = true
+
+[dependencies.gix-odb]
+version = "*"
+optional = true
+
+[dependencies.gix-index]
+version = "*"
+optional = true

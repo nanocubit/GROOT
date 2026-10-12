@@ -1,0 +1,21 @@
+[package]
+name = "groot-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+thiserror = "1"
+# gitoxide crates used by the Gitoxide adapter (used at integration/test time in GROOT)
+gix = "*"
+gix-discover = "*"
+gix-odb = "*"
+gix-index = "*"

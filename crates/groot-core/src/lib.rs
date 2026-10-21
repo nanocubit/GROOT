@@ -1,4 +1,7 @@
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendKind {
@@ -20,6 +23,10 @@ pub enum BackendError {
     NotARepository(String),
     #[error("backend not implemented: {0}")]
     NotImplemented(String),
+    #[error("git command failed: {0}")]
+    GitCommand(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
@@ -45,55 +52,122 @@ pub trait GitBackend: Send + Sync {
     fn read_object(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String>;
 }
 
+fn git_output(dir: &Path, args: &[&str]) -> BackendResult<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .map_err(BackendError::from)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(BackendError::GitCommand(stderr));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_output_with_git_dir(git_dir: &Path, work_tree: Option<&Path>, args: &[&str]) -> BackendResult<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir").arg(git_dir);
+    if let Some(work_tree) = work_tree {
+        cmd.arg("--work-tree").arg(work_tree);
+    }
+    cmd.args(args);
+
+    let output = cmd.output().map_err(BackendError::from)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(BackendError::GitCommand(stderr));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn repository_kind_from_git_dir(git_dir: &Path, work_tree: Option<&Path>) -> BackendResult<RepositoryKind> {
+    let is_bare = git_output_with_git_dir(git_dir, work_tree, &["rev-parse", "--is-bare-repository"])?
+        .trim()
+        .eq("true");
+
+    if is_bare {
+        Ok(RepositoryKind::Bare)
+    } else {
+        Ok(RepositoryKind::Worktree)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LegacyBackend;
 
 impl GitBackend for LegacyBackend {
     fn discover(start: &Path) -> BackendResult<RepositoryHandle> {
-        let candidate = if start.exists() {
-            start.to_path_buf()
+        let candidate = start.canonicalize().map_err(|_| BackendError::NotARepository(start.display().to_string()))?;
+
+        let git_dir = if candidate.join(".git").exists() {
+            candidate.join(".git")
+        } else if candidate.ends_with(".git") {
+            candidate
         } else {
-            return Err(BackendError::NotARepository(start.display().to_string()));
+            return Err(BackendError::NotARepository(candidate.display().to_string()));
         };
 
+        let git_dir = git_dir.canonicalize().map_err(|_| BackendError::NotARepository(git_dir.display().to_string()))?;
+        let work_tree = if git_dir.file_name() == Some(OsStr::new(".git")) {
+            Some(candidate.clone())
+        } else {
+            None
+        };
+
+        if !git_dir.join("HEAD").exists() && !git_dir.join("objects").exists() {
+            return Err(BackendError::NotARepository(git_dir.display().to_string()));
+        }
+
+        let kind = repository_kind_from_git_dir(&git_dir, work_tree.as_deref())?;
+
         Ok(RepositoryHandle {
-            git_dir: candidate.clone(),
-            work_tree: Some(candidate.clone()),
-            kind: RepositoryKind::Worktree,
+            git_dir,
+            work_tree,
+            kind,
             backend: BackendKind::Legacy,
         })
     }
 
     fn open(git_dir: &Path, work_tree: Option<&Path>) -> BackendResult<RepositoryHandle> {
-        if !git_dir.exists() {
+        let git_dir = git_dir.canonicalize().map_err(|_| BackendError::NotARepository(git_dir.display().to_string()))?;
+
+        if !git_dir.join("HEAD").exists() && !git_dir.join("objects").exists() {
             return Err(BackendError::NotARepository(git_dir.display().to_string()));
         }
 
+        let work_tree = work_tree.map(PathBuf::from);
+        let kind = repository_kind_from_git_dir(&git_dir, work_tree.as_deref())?;
+
         Ok(RepositoryHandle {
-            git_dir: git_dir.to_path_buf(),
-            work_tree: work_tree.map(PathBuf::from),
-            kind: if work_tree.is_some() {
-                RepositoryKind::Worktree
-            } else {
-                RepositoryKind::Bare
-            },
+            git_dir,
+            work_tree,
+            kind,
             backend: BackendKind::Legacy,
         })
     }
 
     fn load_index(repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
+        let path = repo.git_dir.join("index");
+        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
         Ok(RepositoryIndex {
-            entries: vec![format!("legacy-index:{}", repo.git_dir.display())],
+            entries: vec![format!("git-index:{}:{}", path.display(), file_size)],
         })
     }
 
-    fn write_index(repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
-        index.entries.push(format!("legacy-write:{}", repo.git_dir.display()));
+    fn write_index(_: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
+        index.entries.push("write-index:placeholder".to_string());
         Ok(())
     }
 
     fn read_object(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
-        Ok(format!("legacy-object:{}:{}", repo.git_dir.display(), object_id))
+        let work_tree = repo.work_tree.as_deref();
+        let raw = git_output_with_git_dir(&repo.git_dir, work_tree, &["cat-file", "-p", object_id])?;
+        Ok(raw)
     }
 }
 
@@ -102,50 +176,73 @@ pub struct GitoxideBackend;
 
 impl GitBackend for GitoxideBackend {
     fn discover(start: &Path) -> BackendResult<RepositoryHandle> {
-        let candidate = if start.exists() {
-            start.to_path_buf()
+        let candidate = start.canonicalize().map_err(|_| BackendError::NotARepository(start.display().to_string()))?;
+
+        let git_dir = if candidate.join(".git").exists() {
+            candidate.join(".git")
+        } else if candidate.ends_with(".git") {
+            candidate
         } else {
-            return Err(BackendError::NotARepository(start.display().to_string()));
+            return Err(BackendError::NotARepository(candidate.display().to_string()));
         };
 
+        let git_dir = git_dir.canonicalize().map_err(|_| BackendError::NotARepository(git_dir.display().to_string()))?;
+        let work_tree = if git_dir.file_name() == Some(OsStr::new(".git")) {
+            Some(candidate.clone())
+        } else {
+            None
+        };
+
+        if !git_dir.join("HEAD").exists() && !git_dir.join("objects").exists() {
+            return Err(BackendError::NotARepository(git_dir.display().to_string()));
+        }
+
+        let kind = repository_kind_from_git_dir(&git_dir, work_tree.as_deref())?;
+
         Ok(RepositoryHandle {
-            git_dir: candidate.clone(),
-            work_tree: Some(candidate.clone()),
-            kind: RepositoryKind::Worktree,
+            git_dir,
+            work_tree,
+            kind,
             backend: BackendKind::Gitoxide,
         })
     }
 
     fn open(git_dir: &Path, work_tree: Option<&Path>) -> BackendResult<RepositoryHandle> {
-        if !git_dir.exists() {
+        let git_dir = git_dir.canonicalize().map_err(|_| BackendError::NotARepository(git_dir.display().to_string()))?;
+
+        if !git_dir.join("HEAD").exists() && !git_dir.join("objects").exists() {
             return Err(BackendError::NotARepository(git_dir.display().to_string()));
         }
 
+        let work_tree = work_tree.map(PathBuf::from);
+        let kind = repository_kind_from_git_dir(&git_dir, work_tree.as_deref())?;
+
         Ok(RepositoryHandle {
-            git_dir: git_dir.to_path_buf(),
-            work_tree: work_tree.map(PathBuf::from),
-            kind: if work_tree.is_some() {
-                RepositoryKind::Worktree
-            } else {
-                RepositoryKind::Bare
-            },
+            git_dir,
+            work_tree,
+            kind,
             backend: BackendKind::Gitoxide,
         })
     }
 
     fn load_index(repo: &RepositoryHandle) -> BackendResult<RepositoryIndex> {
+        let path = repo.git_dir.join("index");
+        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
         Ok(RepositoryIndex {
-            entries: vec![format!("gix-index:{}", repo.git_dir.display())],
+            entries: vec![format!("gitoxide-index:{}:{}", path.display(), file_size)],
         })
     }
 
-    fn write_index(repo: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
-        index.entries.push(format!("gix-write:{}", repo.git_dir.display()));
+    fn write_index(_: &RepositoryHandle, index: &mut RepositoryIndex) -> BackendResult<()> {
+        index.entries.push("write-index:placeholder".to_string());
         Ok(())
     }
 
     fn read_object(repo: &RepositoryHandle, object_id: &str) -> BackendResult<String> {
-        Ok(format!("gix-object:{}:{}", repo.git_dir.display(), object_id))
+        let work_tree = repo.work_tree.as_deref();
+        let raw = git_output_with_git_dir(&repo.git_dir, work_tree, &["cat-file", "-p", object_id])?;
+        Ok(raw)
     }
 }
 
